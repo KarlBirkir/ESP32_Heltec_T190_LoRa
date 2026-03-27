@@ -7,6 +7,17 @@
  *    PRG = GPIO 0   — top-right corner
  *    USR = GPIO 21  — top-left corner
  *
+ *  MAIN SCREEN BUTTONS:
+ *    PRG short  — TX (or sync+TX if settings dirty)
+ *    PRG long   — Toggle beacon mode
+ *    USR short  — Enter settings
+ *    USR long   — Force-apply pending settings locally (no sync)
+ *
+ *  SETTINGS SCREEN BUTTONS:
+ *    PRG short  — Cycle selected value
+ *    USR short  — Move highlight / exit on wrap
+ *    USR long   — Roll back pending changes to current active settings
+ *
  *  DISPLAY PINS (internal, default SPI):
  *    MOSI=48  SCLK=38  CS=39  DC=47  RST=40
  *    BL=17 (backlight, HIGH=on)
@@ -84,10 +95,12 @@
 #define Y_HIST_ROWS   100   // 6 rows × 14px = 84px → ends at 184
 #define Y_DIV3        185   // subtle separator
 #define Y_WAITING     188   // status / waiting line
+#define Y_HINT1       202   // bottom hint line 1
+#define Y_HINT2       214   // bottom hint line 2
 #define BAR_W          82   // width of RSSI bar
 #define BAR_H          11   // height of RSSI bar
-#define BAR_X           2   // left edge of bar
-#define NUM_X         (BAR_X + BAR_W + 4)  // x for RSSI number after bar
+#define BAR_X           2   // left edge of labels
+#define NUM_X         (BAR_X + BAR_W + 4 + 20)  // x for RSSI number after bar
 
 // ── Colour palette (RGB565) ───────────────────────────────────
 #define C_BG        0x0008   // near-black
@@ -139,7 +152,7 @@ struct PingRecord {
     int16_t  localRSSI;
     int8_t   localSNR;
     uint32_t roundTripMs;
-    uint8_t  sfIdx;      // settings active when this ping was measured
+    uint8_t  sfIdx;
     uint8_t  freqIdx;
     uint8_t  bwIdx;
     bool     valid;
@@ -166,7 +179,7 @@ struct ResponsePacket {
 };
 
 struct SettingsPacket {
-    uint8_t  type;      // PKT_SETTINGS
+    uint8_t  type;
     uint16_t seq;
     uint8_t  sfIdx;
     uint8_t  freqIdx;
@@ -174,7 +187,7 @@ struct SettingsPacket {
 };
 
 struct SettingsAckPacket {
-    uint8_t  type;      // PKT_SETTINGS_ACK
+    uint8_t  type;
     uint16_t seq;
 };
 #pragma pack(pop)
@@ -194,51 +207,55 @@ SPIClass        loraSPI(HSPI);
 SX1262*         radio = nullptr;
 Preferences     prefs;
 
-// ── Active settings (what the radio is currently tuned to) ────
-uint8_t sfIdx   = 2;   // default SF12
-uint8_t freqIdx = 1;   // default 868 MHz
-uint8_t bwIdx   = 1;   // default 125 kHz
+// ── Active settings (what the radio is tuned to, remote knows) ─
+uint8_t sfIdx   = 2;
+uint8_t freqIdx = 1;
+uint8_t bwIdx   = 1;
 
-// ── Pending settings (what user has dialled in, may differ) ───
+// ── Pending settings (user has dialled in, may differ) ────────
 uint8_t pendingSfIdx   = 2;
 uint8_t pendingFreqIdx = 1;
 uint8_t pendingBwIdx   = 1;
 
-// dirty = pending differs from active (remote hasn't been updated yet)
-bool settingsDirty = false;
+// settingsDirty  — pending differs from active
+// settingsForced — force-applied locally, remote may not match
+bool settingsDirty  = false;
+bool settingsForced = false;
 
 // ── TX / RX state ─────────────────────────────────────────────
-uint16_t  txSeq        = 0;
-uint32_t  txTimestamp  = 0;
-RadioState radioState  = RADIO_IDLE;
-uint32_t  replyTimeout = 15000;   // recalculated after settings change
-uint8_t   settingsRetry = 0;      // retry counter for settings sync
-uint16_t  settingsSeq  = 0;       // seq used for current settings handshake
+uint16_t   txSeq         = 0;
+uint32_t   txTimestamp   = 0;
+RadioState radioState    = RADIO_IDLE;
+uint32_t   replyTimeout  = 15000;
+uint8_t    settingsRetry = 0;
+uint16_t   settingsSeq   = 0;
 
 // ── Beacon ────────────────────────────────────────────────────
 bool     beaconMode     = false;
 uint32_t nextBeaconTime = 0;
-uint32_t lastRTT        = 0;       // used to set next beacon interval
+uint32_t lastRTT        = 0;
 
 // ── Long-press detection ──────────────────────────────────────
-uint32_t prgDownAt     = 0;
-bool     prgLongFired  = false;    // prevent repeat fires while held
+uint32_t prgDownAt    = 0;
+bool     prgLongFired = false;
+uint32_t usrDownAt    = 0;
+bool     usrLongFired = false;
 
 // ── History ring buffer ───────────────────────────────────────
 PingRecord history[HISTORY_SIZE];
-uint8_t    histHead = 0;   // next write slot; oldest entry is at histHead
+uint8_t    histHead = 0;
 
 // ── UI state ──────────────────────────────────────────────────
-uint8_t  currentScreen = 0;   // 0=main, 1=settings
-uint8_t  settingsRow   = 0;   // highlighted row in settings screen
+uint8_t  currentScreen = 0;
+uint8_t  settingsRow   = 0;
 
 // ── Notification banner ───────────────────────────────────────
-bool     notifActive  = false;
-uint32_t notifExpiry  = 0;
+bool     notifActive = false;
+uint32_t notifExpiry = 0;
 char     notifText[28] = {};
-uint16_t notifColor   = C_WHITE;
+uint16_t notifColor  = C_WHITE;
 
-// ── Button edge detection (raw digitalRead values) ────────────
+// ── Button edge detection ─────────────────────────────────────
 uint8_t btnPrgPrev = HIGH;
 uint8_t btnUsrPrev = HIGH;
 
@@ -249,7 +266,7 @@ volatile bool rxFlag = false;
 void IRAM_ATTR onDio1Rise() { rxFlag = true; }
 
 // ============================================================
-//  WDT feed (timer group register direct write)
+//  WDT feed
 // ============================================================
 
 void feedWDT() {
@@ -266,23 +283,21 @@ void feedWDT() {
 // ============================================================
 
 void loadSettings() {
-    prefs.begin("lora_cfg", true);   // read-only
+    prefs.begin("lora_cfg", true);
     sfIdx   = prefs.getUChar("sf",   2);
     freqIdx = prefs.getUChar("freq", 1);
     bwIdx   = prefs.getUChar("bw",   1);
     prefs.end();
-    // Clamp to valid range in case NVS has stale values
     sfIdx   = min(sfIdx,   (uint8_t)(SF_COUNT   - 1));
     freqIdx = min(freqIdx, (uint8_t)(FREQ_COUNT - 1));
     bwIdx   = min(bwIdx,   (uint8_t)(BW_COUNT   - 1));
-    // Pending starts equal to active
     pendingSfIdx   = sfIdx;
     pendingFreqIdx = freqIdx;
     pendingBwIdx   = bwIdx;
 }
 
 void saveSettings() {
-    prefs.begin("lora_cfg", false);  // read-write
+    prefs.begin("lora_cfg", false);
     prefs.putUChar("sf",   sfIdx);
     prefs.putUChar("freq", freqIdx);
     prefs.putUChar("bw",   bwIdx);
@@ -293,13 +308,13 @@ void saveSettings() {
 //  Accessors
 // ============================================================
 
-float   currentFreq()  { return FREQ_OPTIONS[freqIdx]; }
-float   currentBW()    { return BW_OPTIONS[bwIdx]; }
-uint8_t currentSF()    { return SF_OPTIONS[sfIdx]; }
+float   currentFreq() { return FREQ_OPTIONS[freqIdx]; }
+float   currentBW()   { return BW_OPTIONS[bwIdx]; }
+uint8_t currentSF()   { return SF_OPTIONS[sfIdx]; }
 
-float   pendingFreq()  { return FREQ_OPTIONS[pendingFreqIdx]; }
-float   pendingBW()    { return BW_OPTIONS[pendingBwIdx]; }
-uint8_t pendingSF()    { return SF_OPTIONS[pendingSfIdx]; }
+float   pendingFreq() { return FREQ_OPTIONS[pendingFreqIdx]; }
+float   pendingBW()   { return BW_OPTIONS[pendingBwIdx]; }
+uint8_t pendingSF()   { return SF_OPTIONS[pendingSfIdx]; }
 
 void updateDirtyFlag() {
     settingsDirty = (pendingSfIdx   != sfIdx  ||
@@ -312,9 +327,9 @@ void updateDirtyFlag() {
 // ============================================================
 
 uint32_t calcAirTimeMs(uint8_t payloadBytes) {
-    float sf  = (float)currentSF();
-    float bw  = currentBW() * 1000.0f;
-    float ts  = (float)(1 << (int)sf) / bw;
+    float sf   = (float)currentSF();
+    float bw   = currentBW() * 1000.0f;
+    float ts   = (float)(1 << (int)sf) / bw;
     bool  ldro = (currentSF() >= 11 && currentBW() <= 125.0f)
               || (currentSF() >= 12 && currentBW() <= 250.0f);
     float de   = ldro ? 1.0f : 0.0f;
@@ -344,11 +359,9 @@ bool initRadio() {
     loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
     feedWDT();
     delay(50);
-
     radio = new SX1262(new Module(LORA_NSS, LORA_DIO1, LORA_RST,
                                   LORA_BUSY, loraSPI));
     feedWDT();
-
     int s = radio->begin(
         currentFreq(), currentBW(), currentSF(),
         LORA_CR, RADIOLIB_SX126X_SYNC_WORD_PRIVATE,
@@ -370,8 +383,13 @@ bool initRadio() {
     return true;
 }
 
+// FIX: standby() resets FIFO pointers, clearing stale TX data that
+// could otherwise be read as a spurious RX event. rxFlag is also
+// cleared to discard any interrupt that fired during transmit().
 void startReceive() {
     if (!radio) return;
+    radio->standby();
+    rxFlag = false;
     int s = radio->startReceive();
     if (s != RADIOLIB_ERR_NONE)
         Serial.printf("[LoRa] startReceive error: %d\n", s);
@@ -401,7 +419,6 @@ uint16_t rssiColor(int16_t rssiDbm) {
     return C_RED;
 }
 
-// Centre text on C_BG background
 void drawCentred(const char* txt, int16_t y, uint16_t col, uint8_t sz = 1) {
     tft.setTextSize(sz);
     tft.setTextColor(col, C_BG);
@@ -411,8 +428,6 @@ void drawCentred(const char* txt, int16_t y, uint16_t col, uint8_t sz = 1) {
     tft.print(txt);
 }
 
-// Button hint in corner, background = C_PANEL
-// pos 0 = top-left (USR), pos 1 = top-right (PRG)
 void drawBtnHint(uint8_t pos, const char* label, uint16_t col) {
     tft.setTextSize(1);
     tft.setTextColor(col, C_PANEL);
@@ -427,9 +442,7 @@ void drawBtnHint(uint8_t pos, const char* label, uint16_t col) {
 }
 
 // ============================================================
-//  Notification banner
-//  Overlays the top bar completely. Buttons are blocked while
-//  a notification is active (notifActive == true).
+//  Notification banner — overlays top bar, blocks buttons
 // ============================================================
 
 void showNotif(const char* msg, uint16_t col, uint32_t durationMs = 3000) {
@@ -438,7 +451,6 @@ void showNotif(const char* msg, uint16_t col, uint32_t durationMs = 3000) {
     notifColor  = col;
     notifActive = true;
     notifExpiry = millis() + durationMs;
-
     tft.fillRect(0, Y_TOPBAR, TFT_W, 14, C_PANEL);
     tft.setTextSize(1);
     tft.setTextColor(col, C_PANEL);
@@ -450,13 +462,11 @@ void showNotif(const char* msg, uint16_t col, uint32_t durationMs = 3000) {
 
 void clearNotif() {
     notifActive = false;
-    // Restore normal top bar for current screen
     tft.fillRect(0, Y_TOPBAR, TFT_W, 14, C_PANEL);
     if (currentScreen == 0) {
         drawBtnHint(0, "[SET]", C_CYAN);
-        // Right hint depends on state
         if (beaconMode) {
-            // beacon hint drawn by updateBeaconHint()
+            // drawn by updateBeaconHint()
         } else if (settingsDirty) {
             drawBtnHint(1, "[SYN]", C_RED);
         } else {
@@ -475,13 +485,11 @@ void clearNotif() {
 }
 
 void checkNotifExpiry() {
-    if (notifActive && millis() >= notifExpiry) {
-        clearNotif();
-    }
+    if (notifActive && millis() >= notifExpiry) clearNotif();
 }
 
 // ============================================================
-//  Top bar helpers
+//  Top bar
 // ============================================================
 
 void drawMainTopBar() {
@@ -497,7 +505,7 @@ void drawMainTopBar() {
     }
     drawBtnHint(0, "[SET]", C_CYAN);
     if (beaconMode) {
-        // beacon hint drawn separately by updateBeaconHint()
+        // drawn by updateBeaconHint()
     } else if (settingsDirty) {
         drawBtnHint(1, "[SYN]", C_RED);
     } else {
@@ -505,7 +513,6 @@ void drawMainTopBar() {
     }
 }
 
-// Pulsing BEACON label on right side of top bar
 void updateBeaconHint() {
     if (!beaconMode || notifActive) return;
     static uint32_t lastPulse = 0;
@@ -513,24 +520,19 @@ void updateBeaconHint() {
     if (millis() - lastPulse < 500) return;
     lastPulse = millis();
     pulseOn   = !pulseOn;
-    // Erase right side of bar
     tft.fillRect(TFT_W / 2, 0, TFT_W / 2, 14, C_PANEL);
-    uint16_t col = pulseOn ? C_ORANGE : C_DGRAY;
-    drawBtnHint(1, "BEACON", col);
+    drawBtnHint(1, "BEACON", pulseOn ? C_ORANGE : C_DGRAY);
 }
 
 // ============================================================
-//  Config line (Y_CFGLINE) — shows active or pending→active
+//  Config line — size-2, three coloured fields
 // ============================================================
 
-// Draw the three config fields individually at size 2.
-// SF=cyan, BW=orange, Freq=green. Changing field turns red with arrow.
-// Fields are spaced manually to fill the bar evenly.
 void drawCfgLine() {
     tft.fillRect(0, Y_CFGLINE, TFT_W, 22, C_BG);
     tft.setTextSize(2);
 
-    // ── SF field (left) ───────────────────────────────────────
+    // SF — left
     {
         char buf[10];
         uint16_t col;
@@ -546,7 +548,7 @@ void drawCfgLine() {
         tft.print(buf);
     }
 
-    // ── BW field (centre) ─────────────────────────────────────
+    // BW — centre
     {
         char buf[12];
         uint16_t col;
@@ -558,14 +560,13 @@ void drawCfgLine() {
             col = C_ORANGE;
         }
         tft.setTextColor(col, C_BG);
-        // Centre this field
         int16_t x1, y1; uint16_t tw, th;
         tft.getTextBounds(buf, 0, Y_CFGLINE, &x1, &y1, &tw, &th);
         tft.setCursor((TFT_W - tw) / 2, Y_CFGLINE);
         tft.print(buf);
     }
 
-    // ── Freq field (right) ────────────────────────────────────
+    // Freq — right
     {
         char buf[12];
         uint16_t col;
@@ -585,6 +586,24 @@ void drawCfgLine() {
 }
 
 // ============================================================
+//  Bottom hints — persistent info lines below history
+// ============================================================
+
+void drawBottomHints() {
+    tft.fillRect(0, Y_HINT1, TFT_W, 24, C_BG);
+    tft.setTextSize(1);
+
+    // Line 1: always shown
+    tft.setTextColor(C_DGRAY, C_BG);
+    drawCentred("Long press [TX] to Beacon", Y_HINT1, C_DGRAY, 1);
+
+    // Line 2: only when settings have been force-applied locally
+    if (settingsForced) {
+        drawCentred("Settings unsynced!", Y_HINT2, C_RED, 1);
+    }
+}
+
+// ============================================================
 //  Main screen static chrome
 // ============================================================
 
@@ -593,29 +612,25 @@ void drawMainStatic() {
     drawMainTopBar();
     drawCfgLine();
 
-    // Subtle separator below config
     tft.drawFastHLine(0, Y_DIV1, TFT_W, C_SEP);
 
-    // REMOTE and LOCAL row labels (static — bars drawn in updateMainLive)
     tft.setTextSize(1);
     tft.setTextColor(C_GRAY, C_BG);
     tft.setCursor(BAR_X, Y_REM_ROW + 2); tft.print("REM");
     tft.setCursor(BAR_X, Y_LOC_ROW + 2); tft.print("LOC");
 
-    // Subtle separator below live section
     tft.drawFastHLine(0, Y_DIV2, TFT_W, C_SEP);
 
-    // HISTORY header strip — teal background
     tft.fillRect(0, Y_HIST_HDR, TFT_W, 12, C_TEAL);
     tft.setTextColor(C_WHITE, C_TEAL); tft.setTextSize(1);
     tft.setCursor(2, Y_HIST_HDR + 2); tft.print("HISTORY");
 
-    // Column header
     tft.setTextColor(C_DGRAY, C_BG); tft.setTextSize(1);
-    tft.setCursor(2, Y_HIST_COL); tft.print("#  RmRX LoRX  RTT[ms]  Conf");
+    tft.setCursor(2, Y_HIST_COL); tft.print("# RmRX LoRX  RTT  Config");
 
-    // Subtle separator below history
     tft.drawFastHLine(0, Y_DIV3, TFT_W, C_SEP);
+
+    drawBottomHints();
 }
 
 // ============================================================
@@ -623,56 +638,46 @@ void drawMainStatic() {
 // ============================================================
 
 void updateMainLive(const PingRecord& r) {
-    // Clear only the dynamic area between the row labels and the separator
-    tft.fillRect(BAR_X + 18, Y_REM_ROW, TFT_W - BAR_X - 18, BAR_H, C_BG);
-    tft.fillRect(BAR_X + 18, Y_LOC_ROW, TFT_W - BAR_X - 18, BAR_H, C_BG);
+    tft.fillRect(BAR_X + 20, Y_REM_ROW, TFT_W - BAR_X - 20, BAR_H, C_BG);
+    tft.fillRect(BAR_X + 20, Y_LOC_ROW, TFT_W - BAR_X - 20, BAR_H, C_BG);
 
     if (!r.valid) {
         tft.setTextColor(C_DGRAY, C_BG); tft.setTextSize(1);
-        tft.setCursor(BAR_X + 20, Y_REM_ROW + 2);
+        tft.setCursor(BAR_X + 22, Y_REM_ROW + 2);
         tft.print("-- no data --");
         return;
     }
 
-    char buf[20];
+    char buf[16];
 
-    // ── REMOTE row: label | bar | RSSI | SNR ─────────────────
+    // REMOTE row
     drawHBar(BAR_X + 20, Y_REM_ROW, BAR_W, BAR_H,
              rssiPct(r.remoteRSSI), rssiColor(r.remoteRSSI), C_BARHINT);
     tft.setTextSize(1);
-    // RSSI
     snprintf(buf, sizeof(buf), "%4d", r.remoteRSSI);
     tft.setTextColor(rssiColor(r.remoteRSSI), C_BG);
-    tft.setCursor(NUM_X + 20, Y_REM_ROW + 2);
-    tft.print(buf);
-    // SNR
+    tft.setCursor(NUM_X, Y_REM_ROW + 2); tft.print(buf);
     snprintf(buf, sizeof(buf), "%+d", r.remoteSNR);
     tft.setTextColor(C_SNR, C_BG);
-    tft.setCursor(NUM_X + 20 + 30, Y_REM_ROW + 2);
-    tft.print(buf);
+    tft.setCursor(NUM_X + 30, Y_REM_ROW + 2); tft.print(buf);
 
-    // ── LOCAL row: label | bar | RSSI | SNR ──────────────────
+    // LOCAL row
     drawHBar(BAR_X + 20, Y_LOC_ROW, BAR_W, BAR_H,
              rssiPct(r.localRSSI), rssiColor(r.localRSSI), C_BARHINT);
-    // RSSI
     snprintf(buf, sizeof(buf), "%4d", r.localRSSI);
     tft.setTextColor(rssiColor(r.localRSSI), C_BG);
-    tft.setCursor(NUM_X + 20, Y_LOC_ROW + 2);
-    tft.print(buf);
-    // SNR
+    tft.setCursor(NUM_X, Y_LOC_ROW + 2); tft.print(buf);
     snprintf(buf, sizeof(buf), "%+d", r.localSNR);
     tft.setTextColor(C_SNR, C_BG);
-    tft.setCursor(NUM_X + 20 + 30, Y_LOC_ROW + 2);
-    tft.print(buf);
+    tft.setCursor(NUM_X + 30, Y_LOC_ROW + 2); tft.print(buf);
 }
 
 // ============================================================
-//  History section — 5 rows, newest first
+//  History — 6 rows, newest first
 // ============================================================
 
-// Compact settings tag: "S12/125/868"
 void fmtTag(char* buf, uint8_t sz, uint8_t si, uint8_t fi, uint8_t bi) {
-    snprintf(buf, sz, "S%u/%.0f/%.0f",
+    snprintf(buf, sz, "%u/%.0f/%.0f",
              SF_OPTIONS[si], BW_OPTIONS[bi], FREQ_OPTIONS[fi]);
 }
 
@@ -680,9 +685,6 @@ void updateMainHistory() {
     tft.fillRect(0, Y_HIST_ROWS, TFT_W, HISTORY_SIZE * 14, C_BG);
 
     for (uint8_t i = 0; i < HISTORY_SIZE; i++) {
-        // histHead = next write slot, so the most recent entry is at
-        // (histHead - 1 + HISTORY_SIZE) % HISTORY_SIZE
-        // We want newest first (i=0 = newest), so:
         uint8_t idx = (histHead + HISTORY_SIZE - 1 - i) % HISTORY_SIZE;
         const PingRecord& r = history[idx];
         int16_t y = Y_HIST_ROWS + (int16_t)i * 14;
@@ -696,77 +698,63 @@ void updateMainHistory() {
             continue;
         }
 
-        char tag[16];
+        char tag[14];
         fmtTag(tag, sizeof(tag), r.sfIdx, r.freqIdx, r.bwIdx);
 
         if (r.lost) {
-            char row[32];
-            snprintf(row, sizeof(row), "#%-4u LOST          %s", r.seq, tag);
             tft.setTextColor(C_RED, C_BG);
+            char row[32];
+            snprintf(row, sizeof(row), "%-2u LOST        %s",
+                     r.seq % 100, tag);
             tft.print(row);
         } else {
-            // Main data left-aligned, tag right-aligned
-            char row[24];
-            snprintf(row, sizeof(row), "%-2u %4d %4d %3u",
-                     r.seq, r.remoteRSSI, r.localRSSI,
-                     (unsigned)min(r.roundTripMs, (uint32_t)9999));
             tft.setTextColor(C_WHITE, C_BG);
+            char row[24];
+            snprintf(row, sizeof(row), "%-2u %4d %4d %4u",
+                     r.seq % 100, r.remoteRSSI, r.localRSSI,
+                     (unsigned)min(r.roundTripMs, (uint32_t)9999));
             tft.print(row);
-            // Tag — right-aligned
             int16_t x1, y1; uint16_t tw, th;
             tft.getTextBounds(tag, 0, y, &x1, &y1, &tw, &th);
-            tft.setTextColor(C_DGRAY, C_BG);
+            tft.setTextColor(C_MUTED, C_BG);
             tft.setCursor(TFT_W - tw - 2, y);
             tft.print(tag);
         }
     }
-
-    // Airtime footer
-
 }
 
 // ============================================================
-//  Status line (Y_WAITING area) — shows current radio state
+//  Status line
 // ============================================================
 
 void updateStatusLine() {
     static uint32_t lastToggle = 0;
     static bool     visible    = false;
-
-    // Pulse every 500ms
     if (millis() - lastToggle >= 500) {
         lastToggle = millis();
         visible    = !visible;
     }
-
     tft.fillRect(0, Y_WAITING, TFT_W, 10, C_BG);
     tft.setTextSize(1);
-
     switch (radioState) {
         case RADIO_WAITING_SETTINGS_ACK:
-            if (visible)
-                drawCentred("syncing settings...", Y_WAITING, C_CYAN, 1);
+            if (visible) drawCentred("syncing settings...", Y_WAITING, C_CYAN, 1);
             break;
         case RADIO_WAITING_RESPONSE:
         case RADIO_BEACON_WAITING:
-            if (visible)
-                drawCentred("waiting for reply...", Y_WAITING, C_YELLOW, 1);
+            if (visible) drawCentred("waiting for reply...", Y_WAITING, C_YELLOW, 1);
             break;
         case RADIO_BEACON_IDLE: {
-            // Show countdown to next beacon
             uint32_t now = millis();
             if (nextBeaconTime > now) {
-                uint32_t remaining = (nextBeaconTime - now) / 1000;
+                uint32_t rem = (nextBeaconTime - now) / 1000;
                 char buf[28];
-                snprintf(buf, sizeof(buf), "beacon in %lus", remaining);
-                tft.setTextColor(C_DGRAY, C_BG);
+                snprintf(buf, sizeof(buf), "beacon in %us", (unsigned)rem);
                 drawCentred(buf, Y_WAITING, C_DGRAY, 1);
             }
             break;
         }
-        case RADIO_IDLE:
-        default:
-            break;
+        default: break;
     }
 }
 
@@ -777,8 +765,38 @@ void clearHistory() {
 
 // ============================================================
 //  Settings screen
-//  drawSettingsValues defined before drawSettingsScreen
 // ============================================================
+
+// Draws current active settings as info line below top bar,
+// matching the style of the main screen config line.
+void drawSettingsInfoLine() {
+    tft.fillRect(0, 18, TFT_W, 10, C_BG);
+    tft.setTextSize(1);
+
+    // SF — cyan, left
+    char sfBuf[6];
+    snprintf(sfBuf, sizeof(sfBuf), "SF%u", currentSF());
+    tft.setTextColor(C_CYAN, C_BG);
+    tft.setCursor(2, 18);
+    tft.print(sfBuf);
+
+    // BW — orange, centre
+    char bwBuf[8];
+    snprintf(bwBuf, sizeof(bwBuf), "%.0fk", currentBW());
+    tft.setTextColor(C_ORANGE, C_BG);
+    int16_t x1, y1; uint16_t tw, th;
+    tft.getTextBounds(bwBuf, 0, 18, &x1, &y1, &tw, &th);
+    tft.setCursor((TFT_W - tw) / 2, 18);
+    tft.print(bwBuf);
+
+    // Freq — green, right
+    char frBuf[8];
+    snprintf(frBuf, sizeof(frBuf), "%.0fM", currentFreq());
+    tft.setTextColor(C_GREEN, C_BG);
+    tft.getTextBounds(frBuf, 0, 18, &x1, &y1, &tw, &th);
+    tft.setCursor(TFT_W - tw - 2, 18);
+    tft.print(frBuf);
+}
 
 void drawSettingsValues() {
     static const int16_t rowY[3] = {44, 90, 136};
@@ -791,7 +809,6 @@ void drawSettingsValues() {
         tft.fillRect(0, y, TFT_W, 34, bg);
         tft.drawRect(0, y, TFT_W, 34, sel ? C_CYAN : C_DGRAY);
 
-        // Show pending values in settings screen
         char val[16];
         if (row == 0)      snprintf(val, sizeof(val), "SF%u",     pendingSF());
         else if (row == 1) snprintf(val, sizeof(val), "%.1f MHz", pendingFreq());
@@ -816,7 +833,6 @@ void drawSettingsScreen() {
     tft.fillRect(0, 0, TFT_W, 14, C_PANEL);
     drawBtnHint(0, "[BACK]", C_CYAN);
     drawBtnHint(1, "[CHG]",  C_ORANGE);
-    // Centre title
     tft.setTextSize(1);
     tft.setTextColor(C_WHITE, C_PANEL);
     int16_t x1, y1; uint16_t tw, th;
@@ -825,9 +841,11 @@ void drawSettingsScreen() {
     tft.print("SETTINGS");
 
     tft.drawFastHLine(0, 14, TFT_W, C_TEAL);
-    tft.setTextColor(C_DGRAY, C_BG); tft.setTextSize(1);
-    tft.setCursor(2, 18); tft.print("USR=move  PRG=change");
-    tft.drawFastHLine(0, 28, TFT_W, C_DGRAY);
+
+    // Info line: current active settings in matching colour style
+    drawSettingsInfoLine();
+
+    tft.drawFastHLine(0, 28, TFT_W, C_SEP);
 
     static const int16_t labelY[3] = {34, 80, 126};
     static const char*   labels[3] = {"Spreading Factor", "Frequency", "Bandwidth"};
@@ -837,11 +855,13 @@ void drawSettingsScreen() {
         tft.print(labels[i]);
     }
 
-    tft.drawFastHLine(0, TFT_H - 28, TFT_W, C_TEAL);
-    tft.setTextColor(C_DGRAY, C_BG);
-    tft.setTextColor(C_CYAN, C_BG);
-    tft.setCursor(2, TFT_H - 24); tft.print("TX sends sync to remote");
-    tft.setCursor(2, TFT_H - 12); tft.print("then pings on new settings");
+    // Bottom hints
+    tft.drawFastHLine(0, TFT_H - 28, TFT_W, C_SEP);
+    tft.setTextColor(C_DGRAY, C_BG); tft.setTextSize(1);
+    tft.setCursor(2, TFT_H - 24);
+    tft.print("Long press [BACK] to reset.");
+    tft.setCursor(2, TFT_H - 12);
+    tft.print("Settings update on next TX.");
 
     drawSettingsValues();
 }
@@ -863,7 +883,6 @@ bool sendSettingsPacket() {
     pkt.freqIdx = pendingFreqIdx;
     pkt.bwIdx   = pendingBwIdx;
 
-    // Transmit on current (old) settings so remote can receive it
     applyRadioSettings();
     int s = radio->transmit((uint8_t*)&pkt, sizeof(pkt));
     txTimestamp = millis();
@@ -906,23 +925,42 @@ bool sendRequest() {
     return false;
 }
 
-// Unified TX action — called from button press and beacon.
-// If settings are dirty, initiates settings sync first.
-// Otherwise sends request directly.
 void doTxAction() {
     if (!radioReady) return;
     if (radioState != RADIO_IDLE && radioState != RADIO_BEACON_IDLE) return;
 
     if (settingsDirty) {
         settingsRetry = 0;
-        if (sendSettingsPacket()) {
+        if (sendSettingsPacket())
             radioState = RADIO_WAITING_SETTINGS_ACK;
-        }
     } else {
-        if (sendRequest()) {
-            radioState = (beaconMode) ? RADIO_BEACON_WAITING
-                                      : RADIO_WAITING_RESPONSE;
-        }
+        if (sendRequest())
+            radioState = beaconMode ? RADIO_BEACON_WAITING : RADIO_WAITING_RESPONSE;
+    }
+}
+
+// Apply pending settings locally without syncing to remote.
+// settingsForced stays true until a successful sync clears it.
+void forceLocalSettings() {
+    if (!settingsDirty) {
+        showNotif("No pending changes", C_DGRAY);
+        return;
+    }
+    sfIdx   = pendingSfIdx;
+    freqIdx = pendingFreqIdx;
+    bwIdx   = pendingBwIdx;
+    settingsDirty  = false;
+    settingsForced = true;
+    replyTimeout   = calcAirTimeMs(sizeof(RequestPacket)) * 3 + 3000;
+    saveSettings();
+    applyRadioSettings();
+    Serial.printf("[LOCAL] Settings forced: SF%u  %.1fMHz  %.0fkHz\n",
+                  currentSF(), currentFreq(), currentBW());
+    if (currentScreen == 0) {
+        drawCfgLine();
+        drawMainTopBar();
+        drawBottomHints();
+        showNotif("Applied locally only", C_YELLOW);
     }
 }
 
@@ -948,15 +986,13 @@ void handleRx() {
 
     if (len < 1) { startReceive(); return; }
 
-    // ── PKT_SETTINGS — remote wants to change settings ────────
+    // ── PKT_SETTINGS ─────────────────────────────────────────
     if (buf[0] == PKT_SETTINGS && len >= sizeof(SettingsPacket)) {
         SettingsPacket pkt;
         memcpy(&pkt, buf, sizeof(pkt));
         Serial.printf("[RX] SETTINGS seq=%u  SF%u  freq%u  bw%u\n",
-                      pkt.seq, SF_OPTIONS[pkt.sfIdx],
-                      pkt.freqIdx, pkt.bwIdx);
+                      pkt.seq, SF_OPTIONS[pkt.sfIdx], pkt.freqIdx, pkt.bwIdx);
 
-        // Send ACK on current (old) settings before switching
         delay(20);
         SettingsAckPacket ack;
         ack.type = PKT_SETTINGS_ACK;
@@ -970,21 +1006,18 @@ void handleRx() {
             Serial.printf("[TX] SETTINGS_ACK failed: %d\n", s);
         }
 
-        // Apply new settings
         sfIdx   = min(pkt.sfIdx,   (uint8_t)(SF_COUNT   - 1));
         freqIdx = min(pkt.freqIdx, (uint8_t)(FREQ_COUNT - 1));
         bwIdx   = min(pkt.bwIdx,   (uint8_t)(BW_COUNT   - 1));
-        // Pending stays in sync — we received what TX wanted
         pendingSfIdx   = sfIdx;
         pendingFreqIdx = freqIdx;
         pendingBwIdx   = bwIdx;
         settingsDirty  = false;
+        settingsForced = false;
         replyTimeout   = calcAirTimeMs(sizeof(RequestPacket)) * 3 + 3000;
         saveSettings();
         applyRadioSettings();
 
-        // If we were in the middle of waiting for a response,
-        // our in-flight request used old settings — cancel it
         if (radioState == RADIO_WAITING_RESPONSE ||
             radioState == RADIO_BEACON_WAITING) {
             radioState = RADIO_IDLE;
@@ -992,12 +1025,15 @@ void handleRx() {
                 showNotif("Remote changed settings", C_CYAN);
                 drawCfgLine();
                 drawMainTopBar();
+                drawBottomHints();
             }
         } else {
             if (currentScreen == 0) {
                 drawCfgLine();
                 drawMainTopBar();
+                drawBottomHints();
             } else {
+                drawSettingsInfoLine();
                 drawSettingsValues();
             }
         }
@@ -1005,49 +1041,44 @@ void handleRx() {
         return;
     }
 
-    // ── PKT_SETTINGS_ACK — our settings sync was accepted ─────
+    // ── PKT_SETTINGS_ACK ─────────────────────────────────────
     if (buf[0] == PKT_SETTINGS_ACK && len >= sizeof(SettingsAckPacket)) {
         if (radioState != RADIO_WAITING_SETTINGS_ACK) {
-            startReceive();
-            return;
+            startReceive(); return;
         }
         SettingsAckPacket ack;
         memcpy(&ack, buf, sizeof(ack));
         if (ack.seq != settingsSeq) {
             Serial.printf("[RX] Stale SETTINGS_ACK seq=%u expected=%u\n",
                           ack.seq, settingsSeq);
-            startReceive();
-            return;
+            startReceive(); return;
         }
-        Serial.printf("[RX] SETTINGS_ACK seq=%u — switching settings\n", ack.seq);
+        Serial.printf("[RX] SETTINGS_ACK seq=%u\n", ack.seq);
 
-        // Apply pending settings
         sfIdx   = pendingSfIdx;
         freqIdx = pendingFreqIdx;
         bwIdx   = pendingBwIdx;
-        settingsDirty = false;
-        replyTimeout  = calcAirTimeMs(sizeof(RequestPacket)) * 3 + 3000;
+        settingsDirty  = false;
+        settingsForced = false;
+        replyTimeout   = calcAirTimeMs(sizeof(RequestPacket)) * 3 + 3000;
         saveSettings();
         applyRadioSettings();
-        // clearHistory();
 
         if (currentScreen == 0) {
             showNotif("Settings synced!", C_GREEN);
             drawCfgLine();
             drawMainTopBar();
+            drawBottomHints();
             updateMainHistory();
         }
 
-        // Immediately send RSSI request on new settings
         radioState = RADIO_IDLE;
-        if (sendRequest()) {
-            radioState = beaconMode ? RADIO_BEACON_WAITING
-                                    : RADIO_WAITING_RESPONSE;
-        }
+        if (sendRequest())
+            radioState = beaconMode ? RADIO_BEACON_WAITING : RADIO_WAITING_RESPONSE;
         return;
     }
 
-    // ── PKT_REQUEST — remote wants an RSSI report ─────────────
+    // ── PKT_REQUEST ───────────────────────────────────────────
     if (buf[0] == PKT_REQUEST && len >= sizeof(RequestPacket)) {
         RequestPacket req;
         memcpy(&req, buf, sizeof(req));
@@ -1073,37 +1104,34 @@ void handleRx() {
         return;
     }
 
-    // ── PKT_RESPONSE — reply to our request ───────────────────
+    // ── PKT_RESPONSE ──────────────────────────────────────────
     if (buf[0] == PKT_RESPONSE && len >= sizeof(ResponsePacket)) {
         if (radioState != RADIO_WAITING_RESPONSE &&
             radioState != RADIO_BEACON_WAITING) {
-            startReceive();
-            return;
+            startReceive(); return;
         }
         ResponsePacket resp;
         memcpy(&resp, buf, sizeof(resp));
-
         if (resp.seq != txSeq) {
             Serial.printf("[RX] Stale RESPONSE seq=%u expected=%u\n",
                           resp.seq, txSeq);
-            startReceive();
-            return;
+            startReceive(); return;
         }
 
         uint32_t rtt = millis() - txTimestamp;
         lastRTT = rtt;
 
-        PingRecord r    = {};
-        r.seq           = resp.seq;
-        r.remoteRSSI    = resp.rssiOfRequest;
-        r.remoteSNR     = resp.snrOfRequest;
-        r.localRSSI     = (int16_t)rxRSSI;
-        r.localSNR      = (int8_t)rxSNR;
-        r.roundTripMs   = rtt;
-        r.sfIdx         = sfIdx;
-        r.freqIdx       = freqIdx;
-        r.bwIdx         = bwIdx;
-        r.valid         = true;
+        PingRecord r  = {};
+        r.seq         = resp.seq;
+        r.remoteRSSI  = resp.rssiOfRequest;
+        r.remoteSNR   = resp.snrOfRequest;
+        r.localRSSI   = (int16_t)rxRSSI;
+        r.localSNR    = (int8_t)rxSNR;
+        r.roundTripMs = rtt;
+        r.sfIdx       = sfIdx;
+        r.freqIdx     = freqIdx;
+        r.bwIdx       = bwIdx;
+        r.valid       = true;
 
         history[histHead] = r;
         histHead = (histHead + 1) % HISTORY_SIZE;
@@ -1117,7 +1145,7 @@ void handleRx() {
         }
 
         if (beaconMode) {
-            radioState    = RADIO_BEACON_IDLE;
+            radioState     = RADIO_BEACON_IDLE;
             nextBeaconTime = millis() + 2 * rtt;
         } else {
             radioState = RADIO_IDLE;
@@ -1131,54 +1159,50 @@ void handleRx() {
 }
 
 // ============================================================
-//  Timeout handler — called from loop()
+//  Timeout handler
 // ============================================================
 
 void handleTimeouts() {
-    if (radioState == RADIO_IDLE ||
-        radioState == RADIO_BEACON_IDLE) return;
-
+    if (radioState == RADIO_IDLE || radioState == RADIO_BEACON_IDLE) return;
     if (millis() - txTimestamp <= replyTimeout) return;
 
     if (radioState == RADIO_WAITING_SETTINGS_ACK) {
         settingsRetry++;
         if (settingsRetry < 3) {
             Serial.printf("[TIMEOUT] SETTINGS retry %u/3\n", settingsRetry);
-            if (sendSettingsPacket()) {
-                // stay in RADIO_WAITING_SETTINGS_ACK
-            } else {
-                radioState = RADIO_IDLE;
-            }
+            if (!sendSettingsPacket()) radioState = RADIO_IDLE;
         } else {
             Serial.println("[TIMEOUT] SETTINGS failed after 3 retries");
             radioState = RADIO_IDLE;
-            if (currentScreen == 0)
-                showNotif("Sync failed!", C_RED);
+            if (currentScreen == 0) showNotif("Sync failed!", C_RED);
         }
         return;
     }
 
-    // RADIO_WAITING_RESPONSE or RADIO_BEACON_WAITING — log as lost
+    // RADIO_WAITING_RESPONSE or RADIO_BEACON_WAITING
     Serial.printf("[TIMEOUT] REQUEST seq=%u\n", txSeq);
 
     PingRecord lost = {};
-    lost.seq    = txSeq;
-    lost.sfIdx  = sfIdx;
+    lost.seq     = txSeq;
+    lost.sfIdx   = sfIdx;
     lost.freqIdx = freqIdx;
-    lost.bwIdx  = bwIdx;
-    lost.valid  = true;
-    lost.lost   = true;
+    lost.bwIdx   = bwIdx;
+    lost.valid   = true;
+    lost.lost    = true;
     history[histHead] = lost;
     histHead = (histHead + 1) % HISTORY_SIZE;
 
     if (currentScreen == 0) {
+        // FIX: clear live section so stale RSSI values don't persist
+        PingRecord empty = {};
+        updateMainLive(empty);
+        updateMainHistory();
         tft.fillRect(0, Y_WAITING, TFT_W, 10, C_BG);
         drawCentred("TIMEOUT — no reply", Y_WAITING, C_RED, 1);
-        updateMainHistory();
     }
 
     if (beaconMode) {
-        radioState    = RADIO_BEACON_IDLE;
+        radioState     = RADIO_BEACON_IDLE;
         nextBeaconTime = millis() + replyTimeout;
     } else {
         radioState = RADIO_IDLE;
@@ -1191,13 +1215,10 @@ void handleTimeouts() {
 
 void setup() {
     feedWDT();
-
     Serial.begin(115200);
     while (!Serial && millis() < 2000) yield();
     Serial.println("\nHeltec T190 — LoRa RSSI Propagation Tester");
 
-    // Load settings from NVS before anything else so first screen
-    // shows the correct values
     loadSettings();
     replyTimeout = calcAirTimeMs(sizeof(RequestPacket)) * 3 + 3000;
 
@@ -1207,8 +1228,6 @@ void setup() {
     pinMode(LED_PIN,   OUTPUT);
     pinMode(BTN_PRG,   INPUT_PULLUP);
     pinMode(BTN_USR,   INPUT_PULLUP);
-    // Do NOT set pinMode on LORA_DIO1 (GPIO14 = JTAG MTCK)
-    // Do NOT set pinMode on GPIO26-32 (internal flash/PSRAM)
     digitalWrite(TFT_VCTRL, LOW);
     digitalWrite(TFT_BL,    HIGH);
     digitalWrite(LED_PIN,   LOW);
@@ -1261,58 +1280,28 @@ void loop() {
         if (radio) handleRx();
     }
 
-    // ── Timeouts ─────────────────────────────────────────────
     handleTimeouts();
 
-    // ── Beacon fire ──────────────────────────────────────────
+    // ── Beacon ───────────────────────────────────────────────
     if (beaconMode && radioState == RADIO_BEACON_IDLE &&
         millis() >= nextBeaconTime) {
         doTxAction();
     }
 
-    // ── Notification expiry ──────────────────────────────────
     checkNotifExpiry();
 
     // ── Button reads ─────────────────────────────────────────
     uint8_t prgNow = digitalRead(BTN_PRG);
     uint8_t usrNow = digitalRead(BTN_USR);
 
-    // ── Long press detection (PRG) ───────────────────────────
+    // ── PRG falling edge ─────────────────────────────────────
     if (prgNow == LOW && btnPrgPrev == HIGH) {
         prgDownAt    = millis();
         prgLongFired = false;
-    }
-    if (prgNow == LOW && !prgLongFired &&
-        millis() - prgDownAt >= 1500) {
-        prgLongFired = true;
-        // Long press only meaningful on main screen
-        if (currentScreen == 0 && !notifActive) {
-            if (beaconMode) {
-                beaconMode = false;
-                radioState = RADIO_IDLE;
-                showNotif("Beacon stopped", C_DGRAY);
-                drawMainTopBar();
-            } else {
-                // Only start beacon if radio is free
-                if (radioState == RADIO_IDLE) {
-                    beaconMode = true;
-                    drawMainTopBar();
-                    doTxAction();   // fire first beacon immediately
-                }
-            }
-        }
-    }
-
-    // ── PRG falling edge ─────────────────────────────────────
-    if (prgNow == LOW && btnPrgPrev == HIGH) {
         if (notifActive) {
             clearNotif();
-            // press consumed — do nothing else
-        } else if (currentScreen == 0) {
-            // Short press handled on release to distinguish from long press
-            // (long press fires via the timer above)
-        } else {
-            // Settings screen: cycle value
+        } else if (currentScreen == 1) {
+            // Settings: cycle value immediately on press
             switch (settingsRow) {
                 case 0: pendingSfIdx   = (pendingSfIdx   + 1) % SF_COUNT;   break;
                 case 1: pendingFreqIdx = (pendingFreqIdx + 1) % FREQ_COUNT; break;
@@ -1321,11 +1310,29 @@ void loop() {
             updateDirtyFlag();
             drawSettingsValues();
         }
+        // Main screen short press handled on release (to distinguish from long)
     }
 
-    // ── PRG rising edge (release) ─────────────────────────────
+    // ── PRG long press ────────────────────────────────────────
+    if (prgNow == LOW && !prgLongFired &&
+        millis() - prgDownAt >= 1500) {
+        prgLongFired = true;
+        if (currentScreen == 0 && !notifActive) {
+            if (beaconMode) {
+                beaconMode = false;
+                radioState = RADIO_IDLE;
+                showNotif("Beacon stopped", C_DGRAY);
+                drawMainTopBar();
+            } else if (radioState == RADIO_IDLE) {
+                beaconMode = true;
+                drawMainTopBar();
+                doTxAction();
+            }
+        }
+    }
+
+    // ── PRG rising edge ───────────────────────────────────────
     if (prgNow == HIGH && btnPrgPrev == LOW) {
-        // Short press on main screen: TX action (if not long press)
         if (!prgLongFired && !notifActive && currentScreen == 0) {
             if (radioState == RADIO_IDLE && radioReady && !beaconMode) {
                 doTxAction();
@@ -1335,28 +1342,58 @@ void loop() {
 
     // ── USR falling edge ─────────────────────────────────────
     if (usrNow == LOW && btnUsrPrev == HIGH) {
+        usrDownAt    = millis();
+        usrLongFired = false;
         if (notifActive) {
             clearNotif();
-            // press consumed
-        } else if (currentScreen == 0) {
-            // Block entry to settings if radio is busy or beacon running
-            if (radioState == RADIO_IDLE && !beaconMode) {
-                currentScreen = 1;
-                drawSettingsScreen();
-            }
+        } else if (currentScreen == 1) {
+            // Settings: advance row or exit on wrap (short press on release)
         } else {
-            // Settings screen: advance row or exit
-            settingsRow++;
-            if (settingsRow >= 3) {
-                settingsRow   = 0;
-                currentScreen = 0;
-                drawMainStatic();
-                // Show most recent ping
-                uint8_t lastIdx = (histHead + HISTORY_SIZE - 1) % HISTORY_SIZE;
-                updateMainLive(history[lastIdx]);
-                updateMainHistory();
-            } else {
+            // Main: enter settings (short press on release)
+        }
+    }
+
+    // ── USR long press ────────────────────────────────────────
+    if (usrNow == LOW && !usrLongFired &&
+        millis() - usrDownAt >= 1500) {
+        usrLongFired = true;
+        if (!notifActive) {
+            if (currentScreen == 0) {
+                // Force-apply pending settings locally
+                forceLocalSettings();
+            } else if (currentScreen == 1) {
+                // Roll back pending to current active
+                pendingSfIdx   = sfIdx;
+                pendingFreqIdx = freqIdx;
+                pendingBwIdx   = bwIdx;
+                updateDirtyFlag();
                 drawSettingsValues();
+                showNotif("Changes rolled back", C_CYAN);
+            }
+        }
+    }
+
+    // ── USR rising edge ───────────────────────────────────────
+    if (usrNow == HIGH && btnUsrPrev == LOW) {
+        if (!usrLongFired && !notifActive) {
+            if (currentScreen == 0) {
+                if (radioState == RADIO_IDLE && !beaconMode) {
+                    currentScreen = 1;
+                    drawSettingsScreen();
+                }
+            } else {
+                // Settings: advance row or exit
+                settingsRow++;
+                if (settingsRow >= 3) {
+                    settingsRow   = 0;
+                    currentScreen = 0;
+                    drawMainStatic();
+                    uint8_t lastIdx = (histHead + HISTORY_SIZE - 1) % HISTORY_SIZE;
+                    updateMainLive(history[lastIdx]);
+                    updateMainHistory();
+                } else {
+                    drawSettingsValues();
+                }
             }
         }
     }
@@ -1364,7 +1401,6 @@ void loop() {
     btnPrgPrev = prgNow;
     btnUsrPrev = usrNow;
 
-    // ── Periodic UI updates (main screen only) ────────────────
     if (currentScreen == 0) {
         updateStatusLine();
         updateBeaconHint();
